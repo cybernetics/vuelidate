@@ -5,8 +5,22 @@ const buildFromKeys = (keys, fn, keyFn) => keys.reduce((build, key) => {
   return build
 }, {})
 
-function isObject (ruleset) {
-  return ruleset !== null && typeof ruleset === 'object'
+function isObject (val) {
+  return val !== null && typeof val === 'object'
+}
+
+function isPromise (object) {
+  return (typeof object === 'object' || typeof object === 'function') && typeof object.then === 'function'
+}
+
+function isNested (ruleset) {
+  return isObject(ruleset) && !isPromise(ruleset)
+}
+
+function getVue (rootVm) {
+  let Vue = rootVm.constructor
+  while (Vue.super) Vue = Vue.super
+  return Vue
 }
 
 const getPath = (ctx, obj, path, fallback) => {
@@ -15,7 +29,7 @@ const getPath = (ctx, obj, path, fallback) => {
   }
 
   path = Array.isArray(path) ? path : path.split('.')
-  for (var i = 0; i < path.length; i++) {
+  for (let i = 0; i < path.length; i++) {
     if (isObject(obj)) {
       obj = obj[path[i]]
     } else {
@@ -33,7 +47,7 @@ function setDirtyRecursive (newState) {
   for (let i = 0; i < keys.length; i++) {
     const ruleOrNested = keys[i]
     const val = this[ruleOrNested]
-    if (isObject(val)) {
+    if (isNested(val)) {
       val[method]()
     }
   }
@@ -52,7 +66,7 @@ const defaultMethods = {
 const defaultComputed = {
   $invalid () {
     return this.dynamicKeys.some(ruleOrNested => {
-      const val = this[ruleOrNested]
+      const val = unwrapMaybeAsync(this, ruleOrNested)
       return isObject(val) ? val.$invalid : !val
     })
   },
@@ -66,22 +80,29 @@ const defaultComputed = {
     for (let i = 0; i < keys.length; i++) {
       const ruleOrNested = keys[i]
       const val = this[ruleOrNested]
-      const isNested = isObject(val)
-      foundNested = foundNested || isNested
-      if (isNested && !val.$dirty) {
+      const nested = isNested(val)
+      foundNested = foundNested || nested
+      if (nested && !val.$dirty) {
         return false
       }
     }
     return foundNested
   },
   $error () {
-    return !!(this.$dirty && this.$invalid)
+    return !!(!this.$pending && this.$dirty && this.$invalid)
+  },
+  $pending () {
+    return this.loadings.length > 0 || this.dynamicKeys.some(ruleOrNested => {
+      const val = this[ruleOrNested]
+      return isNested(val) ? val.$pending : false
+    })
   }
 }
 
 const defaultMethodKeys = Object.keys(defaultMethods)
 const defaultComputedKeys = Object.keys(defaultComputed)
 const mapDynamicKeyName = k => 'v$$' + k
+const mapDynamicToAsync = k => `async$$` + k
 
 function isSingleRule (ruleset) {
   return typeof ruleset === 'function'
@@ -96,13 +117,14 @@ function makeValidationVm (validations, parentVm, rootVm = parentVm, parentProp 
     return mapValidator(rootVm, rule, key, parentVm, parentProp)
   }, mapDynamicKeyName)
 
-  let Vue = rootVm.constructor
-  while (Vue.super) Vue = Vue.super
+  const Vue = getVue(rootVm)
 
   const validationVm = new Vue({
     data: {
       dirty: false,
-      dynamicKeys
+      loadings: [],
+      dynamicKeys,
+      ...buildFromKeys(dynamicKeys.map(mapDynamicToAsync), () => false)
     },
     methods: defaultMethods,
     computed: {
@@ -124,9 +146,71 @@ function mapValidator (rootVm, rule, ruleKey, vm, vmProp) {
   }
 }
 
+function pushLoad (array, key) {
+  if (array.indexOf(key) === -1) {
+    array.push(key)
+  }
+}
+
+function pullLoad (array, key) {
+  const pos = array.indexOf(key)
+  if (pos === -1) {
+    return false
+  }
+  array.splice(pos, 1)
+  return true
+}
+
+function unwrapMaybeAsync (vm, dynamicKey) {
+  const val = vm[dynamicKey]
+  if (isPromise(val)) {
+    const asyncVal = vm[mapDynamicToAsync(dynamicKey)]
+    if (isPromise(asyncVal)) {
+      // still loading, signal invalid
+      return false
+    }
+    return asyncVal
+  }
+  return val
+}
+
 function mapRule (rootVm, rule, ruleKey, parentVm, prop) {
   return function () {
-    return rule.call(rootVm, parentVm[prop], parentVm)
+    const validatorOutput = rule.call(rootVm, parentVm[prop], parentVm)
+
+    // handle async validators that return a Promise
+    if (isPromise(validatorOutput)) {
+      const asyncKey = mapDynamicToAsync(mapDynamicKeyName(ruleKey))
+      const Vue = getVue(rootVm)
+
+      // avoid cyclic observer dependency by putting loading state change to next tick
+      Vue.nextTick(() => {
+        pushLoad(this.loadings, ruleKey)
+      })
+
+      this[asyncKey] = validatorOutput
+      validatorOutput
+        .then(value => {
+          if (this[asyncKey] === validatorOutput && pullLoad(this.loadings, ruleKey)) {
+            this[asyncKey] = value
+          }
+        }, error => {
+          if (this[asyncKey] === validatorOutput && pullLoad(this.loadings, ruleKey)) {
+            this[asyncKey] = false
+          }
+          throw error
+        })
+      // save raw promise in state
+      return validatorOutput
+    }
+
+    // support cross referencing validators, especially validation groups
+    if (isObject(validatorOutput) && validatorOutput.__isVuelidateVm) {
+      return validatorOutput
+    }
+
+    // only standard sync validators left
+    return !!validatorOutput
   }
 }
 
@@ -181,7 +265,7 @@ function proxyVm (vm, originalKeys) {
       return {
         enumerable: true,
         get () {
-          return vm[dynKey]
+          return unwrapMaybeAsync(vm, dynKey)
         }
       }
     }),
@@ -193,7 +277,12 @@ function proxyVm (vm, originalKeys) {
     })),
     ...buildFromKeys(defaultMethodKeys, key => ({
       value: vm[key].bind(vm)
-    }))
+    })),
+    __isVuelidateVm: {
+      configurable: false,
+      enumerable: false,
+      value: true
+    }
   }
 
   return Object.defineProperties({}, redirectDef)

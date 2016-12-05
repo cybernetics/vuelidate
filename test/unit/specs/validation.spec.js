@@ -364,7 +364,7 @@ describe('Validation plugin', () => {
           }
         }
       })
-      expect(vm.$v.group['abc.def.ghi']).to.be.undefined
+      expect(vm.$v.group['abc.def.ghi']).to.be.false
       expect(vm.$v.group.$invalid).to.be.true
     })
   })
