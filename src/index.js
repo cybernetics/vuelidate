@@ -181,10 +181,9 @@ function mapRule (rootVm, rule, ruleKey, parentVm, prop) {
     // handle async validators that return a Promise
     if (isPromise(validatorOutput)) {
       const asyncKey = mapDynamicToAsync(mapDynamicKeyName(ruleKey))
-      const Vue = getVue(rootVm)
 
       // avoid cyclic observer dependency by putting loading state change to next tick
-      Vue.nextTick(() => {
+      rootVm.$nextTick(() => {
         pushLoad(this.loadings, ruleKey)
       })
 

@@ -8,6 +8,12 @@ function isOdd (v) {
   return v % 2 === 1
 }
 
+function isUnique (value) {
+  return new Promise((resolve, reject) => {
+    resolve(typeof value === 'string' && value.length % 2 !== 0)
+  })
+}
+
 const T = () => true
 const F = () => false
 
@@ -15,6 +21,14 @@ const base = {
   data () {
     return {
       value: 4
+    }
+  }
+}
+
+const baseString = {
+  data () {
+    return {
+      value: 'x'
     }
   }
 }
@@ -58,6 +72,33 @@ describe('Validation plugin', () => {
     const vm = new Ctor()
     expect(vm.$v).to.exist
     expect(createSpy).to.have.been.calledOnce
+  })
+
+  describe('$v.value.$pending', () => {
+    it('should be false when handling synchronous validations', () => {
+      const vm = new Vue({
+        ...base,
+        validations: {
+          value: { isEven }
+        }
+      })
+      expect(vm.$v.value.$pending).to.be.false
+    })
+    it('should be true when pending asynchronous validations', (done) => {
+      const vm = new Vue({
+        ...baseString,
+        validations: {
+          value: { isUnique }
+        }
+      })
+      // TODO: This shouldn’t be needed here
+      vm.$v.value.$touch()
+      vm.value = 'x1'
+      vm.$nextTick(() => {
+        expect(vm.$v.value.$pending).to.be.true
+        done()
+      })
+    })
   })
 
   describe('$v.value.$dirty', () => {
